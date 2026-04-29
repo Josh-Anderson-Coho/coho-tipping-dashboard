@@ -17,7 +17,7 @@ UPLOAD_PASSWORD = "C@H@"
 
 
 def extract_round_number(filename: str):
-    """Detect round number from ESPN filename, including finals if ESPN continues numbering files."""
+    """Detect round number from ESPN filename. For finals, continue with the next round number."""
     m = re.search(r"nrl-(\d+)", filename.lower())
     return int(m.group(1)) if m else None
 
@@ -37,17 +37,39 @@ def find_column(columns, exact_options=None, contains_options=None):
     return None
 
 
+def round_tip_columns(columns):
+    found = []
+    for c in columns:
+        m = re.fullmatch(r"ROUND\s+(\d+)", str(c).strip(), re.I)
+        if m:
+            found.append((int(m.group(1)), c))
+    return sorted(found)
+
+
+def round_margin_columns(columns):
+    found = []
+    for c in columns:
+        m = re.fullmatch(r"ROUND\s+(\d+)\s+MARGIN", str(c).strip(), re.I)
+        if m:
+            found.append((int(m.group(1)), c))
+    return sorted(found)
+
+
 @st.cache_data(ttl=60)
 def load_teams():
     path = DATA_DIR / "Teams.csv"
     if not path.exists():
         return pd.DataFrame(columns=["Name", "Team"])
+
     teams = pd.read_csv(path)
     teams.columns = [str(c).strip() for c in teams.columns]
+
     name_col = find_column(teams.columns, ["Name", "NAME", "Entrant", "Player", "Tipper"])
     team_col = find_column(teams.columns, ["Team", "TEAM", "Group"])
+
     if name_col is None or team_col is None:
         return pd.DataFrame(columns=["Name", "Team"])
+
     teams = teams.rename(columns={name_col: "Name", team_col: "Team"})
     teams["Name"] = teams["Name"].astype(str).str.strip()
     teams["Team"] = teams["Team"].astype(str).str.strip()
@@ -55,74 +77,82 @@ def load_teams():
 
 
 @st.cache_data(ttl=60)
-def load_round_files():
-    files = glob.glob(str(DATA_DIR / "competition-Coho Footy Tipping-nrl-*.csv"))
-    frames = []
+def load_all_rounds():
+    """
+    Loads every ESPN CSV in /data and builds one row per entrant per round.
+    ESPN adds columns each week, so this does not rely on a fixed schema.
+    """
+    files = sorted(glob.glob(str(DATA_DIR / "competition-Coho Footy Tipping-nrl-*.csv")))
+    weekly_rows = []
     skipped = []
 
     for file in files:
-        round_no = extract_round_number(os.path.basename(file))
-        if round_no is None:
-            skipped.append(os.path.basename(file))
+        filename = os.path.basename(file)
+        file_round = extract_round_number(filename)
+        if file_round is None:
+            skipped.append(filename)
             continue
 
         raw = pd.read_csv(file)
         raw.columns = [str(c).strip() for c in raw.columns]
         name_col = find_column(raw.columns, ["NAME", "Name", "Entrant", "Player", "Tipper"])
-        rank_col = find_column(raw.columns, ["RANK", "Rank"])
-        total_score_col = find_column(raw.columns, ["TOTAL SCORE", "Total Score", "Score", "Points"])
-        total_margin_col = find_column(raw.columns, ["TOTAL MARGIN", "Total Margin"])
-        round_tips_col = find_column(raw.columns, [f"ROUND {round_no}", f"Round {round_no}"])
-        round_margin_col = find_column(raw.columns, [f"ROUND {round_no} MARGIN", f"Round {round_no} Margin"])
 
         if name_col is None:
-            skipped.append(os.path.basename(file))
+            skipped.append(filename)
             continue
 
-        out = pd.DataFrame()
-        out["Name"] = raw[name_col].astype(str).str.strip()
-        out["Round"] = round_no
-        out["Source File"] = os.path.basename(file)
+        tips_col = find_column(raw.columns, [f"ROUND {file_round}", f"Round {file_round}"])
+        margin_col = find_column(raw.columns, [f"ROUND {file_round} MARGIN", f"Round {file_round} Margin"])
 
-        out["Rank"] = pd.to_numeric(raw[rank_col], errors="coerce") if rank_col is not None else pd.NA
+        if tips_col is None:
+            tips_found = round_tip_columns(raw.columns)
+            tips_col = tips_found[-1][1] if tips_found else None
+            file_round = tips_found[-1][0] if tips_found else file_round
 
-        if round_tips_col is not None:
-            out["Round Tips"] = pd.to_numeric(raw[round_tips_col], errors="coerce").fillna(0)
-        else:
-            round_tip_cols = [c for c in raw.columns if re.fullmatch(r"ROUND \d+", str(c).strip(), re.I)]
-            out["Round Tips"] = pd.to_numeric(raw[round_tip_cols[-1]], errors="coerce").fillna(0) if round_tip_cols else 0
+        if margin_col is None:
+            margin_found = round_margin_columns(raw.columns)
+            margin_col = margin_found[-1][1] if margin_found else None
 
-        if round_margin_col is not None:
-            out["Round Margin"] = pd.to_numeric(raw[round_margin_col], errors="coerce").fillna(999999)
-        else:
-            margin_cols = [c for c in raw.columns if re.fullmatch(r"ROUND \d+ MARGIN", str(c).strip(), re.I)]
-            out["Round Margin"] = pd.to_numeric(raw[margin_cols[-1]], errors="coerce").fillna(999999) if margin_cols else 999999
+        if tips_col is None:
+            skipped.append(filename)
+            continue
 
-        if total_score_col is not None:
-            out["Total Score"] = pd.to_numeric(raw[total_score_col], errors="coerce").fillna(0)
-        else:
-            score_cols = [c for c in raw.columns if re.fullmatch(r"ROUND \d+", str(c).strip(), re.I)]
-            out["Total Score"] = raw[score_cols].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1) if score_cols else out["Round Tips"]
+        out = pd.DataFrame({
+            "Name": raw[name_col].astype(str).str.strip(),
+            "Round": int(file_round),
+            "Round Tips": pd.to_numeric(raw[tips_col], errors="coerce").fillna(0),
+            "Round Margin": pd.to_numeric(raw[margin_col], errors="coerce").fillna(0) if margin_col is not None else 0,
+            "Source File": filename,
+        })
+        weekly_rows.append(out)
 
-        if total_margin_col is not None:
-            out["Total Margin"] = pd.to_numeric(raw[total_margin_col], errors="coerce").fillna(999999)
-        else:
-            margin_cols = [c for c in raw.columns if re.fullmatch(r"ROUND \d+ MARGIN", str(c).strip(), re.I)]
-            out["Total Margin"] = raw[margin_cols].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1) if margin_cols else out["Round Margin"]
-
-        if out["Rank"].isna().all():
-            out = out.sort_values(["Total Score", "Total Margin", "Name"], ascending=[False, True, True])
-            out["Rank"] = range(1, len(out) + 1)
-
-        frames.append(out)
-
-    if not frames:
+    if not weekly_rows:
         return pd.DataFrame(), skipped
 
-    df = pd.concat(frames, ignore_index=True)
-    df["Round"] = df["Round"].astype(int)
-    df["Rank"] = pd.to_numeric(df["Rank"], errors="coerce")
-    return df, skipped
+    weekly = pd.concat(weekly_rows, ignore_index=True)
+    weekly = weekly.drop_duplicates(subset=["Name", "Round"], keep="last")
+
+    names = sorted(weekly["Name"].unique(), key=lambda x: str(x).lower())
+    rounds = sorted(weekly["Round"].unique())
+    grid = pd.MultiIndex.from_product([names, rounds], names=["Name", "Round"]).to_frame(index=False)
+    full = grid.merge(weekly, on=["Name", "Round"], how="left")
+    full["Round Tips"] = pd.to_numeric(full["Round Tips"], errors="coerce").fillna(0)
+    full["Round Margin"] = pd.to_numeric(full["Round Margin"], errors="coerce").fillna(0)
+    full["Source File"] = full["Source File"].fillna("")
+
+    full = full.sort_values(["Name", "Round"])
+    full["Total Score"] = full.groupby("Name")["Round Tips"].cumsum()
+    full["Total Margin"] = full.groupby("Name")["Round Margin"].cumsum()
+
+    ranked_frames = []
+    for round_no in rounds:
+        r = full[full["Round"] == round_no].copy()
+        r = r.sort_values(["Total Score", "Total Margin", "Name"], ascending=[False, True, True])
+        r["Rank"] = range(1, len(r) + 1)
+        ranked_frames.append(r)
+
+    data = pd.concat(ranked_frames, ignore_index=True)
+    return data, skipped
 
 
 def get_secret_value(*names, default=None):
@@ -189,15 +219,16 @@ def upload_csv_to_github(uploaded_file, round_number: int):
     return False, f'GitHub upload failed: {response.status_code} - {response.text[:500]}'
 
 
-raw_data, skipped_files = load_round_files()
+raw_data, skipped_files = load_all_rounds()
 teams = load_teams()
 
 st.title("🏉 Coho Footy Tipping Dashboard")
 
 st.markdown("""
 <style>
-    .block-container {padding-top: 1.2rem; padding-left: 1rem; padding-right: 1rem;}
+    .block-container {padding-top: 1.2rem; padding-left: 1rem; padding-right: 1rem; max-width: 1500px;}
     div[data-testid="stMetric"] {background: rgba(250,250,250,0.03); padding: 0.6rem; border-radius: 0.6rem;}
+    .stDataFrame {width: 100%;}
     @media (max-width: 900px) {
         section.main .block-container {padding-left: 0.5rem; padding-right: 0.5rem;}
         div[data-testid="column"] {width: 100% !important; flex: 1 1 100% !important; min-width: 100% !important;}
@@ -221,8 +252,8 @@ else:
 
 data["Team"] = data["Team"].fillna("Unassigned")
 rounds = sorted(data["Round"].unique())
-entrants = sorted(data["Name"].unique())
-teams_available = sorted([t for t in data["Team"].dropna().unique()])
+entrants = sorted(data["Name"].unique(), key=lambda x: str(x).lower())
+teams_available = sorted([t for t in data["Team"].dropna().unique()], key=lambda x: str(x).lower())
 
 st.sidebar.title("Controls")
 selected_round = st.sidebar.selectbox("Select round", rounds, index=len(rounds) - 1)
@@ -238,7 +269,7 @@ next_round = int(max(rounds) + 1) if rounds else 1
 upload_round = st.sidebar.number_input(
     "Save as round number",
     min_value=1,
-    max_value=40,
+    max_value=60,
     value=next_round,
     step=1,
     help="Use the next NRL round number. For finals, continue numbering after the regular season.",
@@ -298,9 +329,9 @@ all_highlight_names = set(highlight_names) | team_highlight_names
 if show_all:
     chart_names = entrants
 elif all_highlight_names:
-    chart_names = sorted(all_highlight_names)
+    chart_names = sorted(all_highlight_names, key=lambda x: str(x).lower())
 else:
-    chart_names = current.head(10)["Name"].tolist()
+    chart_names = sorted(current.head(10)["Name"].tolist(), key=lambda x: str(x).lower())
     st.info("Showing current top 10. Tick 'Show all entrants' or choose highlights in the sidebar.")
 
 fig = go.Figure()
@@ -308,25 +339,32 @@ for name in chart_names:
     person = data[data["Name"] == name].sort_values("Round")
     is_highlight = name in all_highlight_names
     if all_highlight_names:
-        width = 5 if is_highlight else 1
-        opacity = 1.0 if is_highlight else 0.20
+        width = 6 if is_highlight else 1.2
+        opacity = 1.0 if is_highlight else 0.22
+        marker_size = 11 if is_highlight else 4
     else:
         width = 2
         opacity = 0.85
+        marker_size = 5
     fig.add_trace(go.Scatter(
         x=person["Round"],
         y=person["Rank"],
         mode="lines+markers",
         name=name,
         line={"width": width},
-        marker={"size": 10 if is_highlight else 5, "line": {"width": 2 if is_highlight else 0}},
+        marker={"size": marker_size, "line": {"width": 2 if is_highlight else 0}},
         opacity=opacity,
-        customdata=person[["Round Tips", "Round Margin", "Team"]],
-        hovertemplate="%{fullData.name}<br>Round %{x}<br>Rank %{y}<br>Tips %{customdata[0]}<br>Margin %{customdata[1]}<br>Team %{customdata[2]}<extra></extra>",
+        customdata=person[["Round Tips", "Round Margin", "Total Score", "Total Margin", "Team"]],
+        hovertemplate=(
+            "%{fullData.name}<br>Round %{x}<br>Rank %{y}"
+            "<br>Round tips %{customdata[0]}<br>Round margin %{customdata[1]}"
+            "<br>Total tips %{customdata[2]}<br>Total margin %{customdata[3]}"
+            "<br>Team %{customdata[4]}<extra></extra>"
+        ),
     ))
 fig.update_yaxes(autorange="reversed", title="Rank")
 fig.update_xaxes(dtick=1, title="Round")
-fig.update_layout(height=650, legend_title_text="Entrant")
+fig.update_layout(height=650, legend_title_text="Entrant", legend_traceorder="normal")
 st.plotly_chart(fig, use_container_width=True)
 
 st.subheader("Round Movement — Biggest Climbers and Fallers")
@@ -342,24 +380,26 @@ else:
         orientation="h",
         color="Movement",
         color_continuous_scale="Plasma",
-        hover_data=["Rank", "Previous Rank", "Round Tips", "Round Margin", "Team"],
+        hover_data=["Rank", "Previous Rank", "Round Tips", "Round Margin", "Total Score", "Total Margin", "Team"],
         labels={"Movement": "Rank Change", "Name": ""},
     )
     bar.update_layout(height=max(650, 22 * len(movement_chart)), coloraxis_colorbar_title="Rank Change")
     st.plotly_chart(bar, use_container_width=True)
 
-left, right = st.columns(2)
-with left:
-    st.subheader(f"Round {selected_round} Leaderboard")
-    display_current = current.sort_values("Rank")[["Rank", "Name", "Round Tips", "Round Margin", "Total Score", "Total Margin", "Movement", "Team"]]
-    st.dataframe(display_current, use_container_width=True, hide_index=True)
-with right:
-    st.subheader(f"Round {selected_round} Team Leaderboard — Season Total Average")
-    display_teams = team_stats[["Team Rank", "Team", "Average_Total_Tips", "Average_Total_Margin", "Participants"]].copy()
-    display_teams = display_teams.rename(columns={
-        "Average_Total_Tips": "Avg Total Tips",
-        "Average_Total_Margin": "Avg Total Margin",
-    })
-    display_teams["Avg Total Tips"] = display_teams["Avg Total Tips"].round(2)
-    display_teams["Avg Total Margin"] = display_teams["Avg Total Margin"].round(2)
-    st.dataframe(display_teams, use_container_width=True, hide_index=True)
+st.subheader(f"Round {selected_round} Leaderboard")
+display_current = current.sort_values("Rank")[[
+    "Rank", "Name", "Round Tips", "Round Margin", "Total Score", "Total Margin", "Movement", "Team"
+]].rename(columns={
+    "Total Score": "Total Tips",
+})
+st.dataframe(display_current, use_container_width=True, hide_index=True, height=520)
+
+st.subheader(f"Round {selected_round} Team Leaderboard — Season Total Average")
+display_teams = team_stats[["Team Rank", "Team", "Average_Total_Tips", "Average_Total_Margin", "Participants"]].copy()
+display_teams = display_teams.rename(columns={
+    "Average_Total_Tips": "Avg Total Tips",
+    "Average_Total_Margin": "Avg Total Margin",
+})
+display_teams["Avg Total Tips"] = display_teams["Avg Total Tips"].round(2)
+display_teams["Avg Total Margin"] = display_teams["Avg Total Margin"].round(2)
+st.dataframe(display_teams, use_container_width=True, hide_index=True, height=420)
