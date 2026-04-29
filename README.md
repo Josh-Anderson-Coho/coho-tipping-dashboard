@@ -1,27 +1,22 @@
 # Coho Footy Tipping Dashboard
 
-## Files
-Upload this whole folder to GitHub. Keep ESPN files in `/data` using filenames like:
+Streamlit dashboard for Coho Footy Tipping.
 
-`competition-Coho Footy Tipping-nrl-9.csv`
+## GitHub upload setup
 
-The app detects the round number from `nrl-9` and will work for any future NRL round/finals file as long as the filename contains that number.
-
-## GitHub upload from dashboard
-The sidebar uploader is password protected with:
-
-`C@H@`
-
-To let the dashboard commit uploaded CSVs back to GitHub, add these Streamlit secrets:
+Add these to Streamlit Secrets:
 
 ```toml
-[github]
-token = "YOUR_GITHUB_FINE_GRAINED_TOKEN_WITH_CONTENTS_READ_WRITE"
-repo = "Josh-Anderson-Coho/coho-tipping-dashboard"
-branch = "main"
-data_path = "data"
+GITHUB_TOKEN = "your_token_here"
+REPO_NAME = "Josh-Anderson-Coho/coho-tipping-dashboard"
+GITHUB_BRANCH = "main"
+GITHUB_DATA_PATH = "data"
 ```
 
-Create the token in GitHub with access to this repository and Contents: Read and write.
+The admin upload password in the app is `C@H@`.
 
-After a successful upload, Streamlit Cloud should redeploy from the GitHub commit.
+Uploaded CSVs are saved as:
+
+`data/competition-Coho Footy Tipping-nrl-<round>.csv`
+
+For finals, continue the round numbering after the regular season.
