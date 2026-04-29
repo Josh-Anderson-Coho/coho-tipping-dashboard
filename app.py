@@ -1,169 +1,402 @@
-
+import os
 import re
-from pathlib import Path
+import glob
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-st.set_page_config(page_title="Coho Tipping Dashboard", layout="wide")
+st.set_page_config(
+    page_title="Coho Footy Tipping Dashboard",
+    layout="wide"
+)
 
-DATA_DIR = Path(__file__).parent / "data"
-DEFAULT_CSV = DATA_DIR / "competition-Coho Footy Tipping-nrl-6.csv"
-TEAM_MAP = DATA_DIR / "team_mapping.csv"
+DATA_DIR = "data"
 
-st.title("Coho Footy Tipping Dashboard")
-st.caption("Round-by-round ladder, weekly movement, team rankings and wrap-up callouts.")
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def extract_round_number(filename):
+    match = re.search(r"nrl-(\d+)", filename.lower())
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def find_column(columns, possible_names):
+    cleaned = {str(c).strip().lower(): c for c in columns}
+
+    for name in possible_names:
+        if name.lower() in cleaned:
+            return cleaned[name.lower()]
+
+    for c in columns:
+        c_lower = str(c).strip().lower()
+        for name in possible_names:
+            if name.lower() in c_lower:
+                return c
+
+    return None
+
 
 @st.cache_data
-def load_default_csv():
-    return pd.read_csv(DEFAULT_CSV)
+def load_round_files():
+    pattern = os.path.join(DATA_DIR, "competition-Coho Footy Tipping-nrl-*.csv")
+    files = glob.glob(pattern)
 
-def normalise_columns(df):
-    df = df.copy()
-    df.columns = [str(c).strip().upper() for c in df.columns]
-    return df
+    round_frames = []
 
-def round_columns(df):
-    rounds = []
-    for c in df.columns:
-        m = re.fullmatch(r"ROUND\s+(\d+)", c)
-        if m:
-            rounds.append((int(m.group(1)), c))
-    return sorted(rounds)
+    for file in files:
+        round_no = extract_round_number(os.path.basename(file))
+        if round_no is None:
+            continue
 
-def build_ladder(df):
-    df = normalise_columns(df)
-    rounds = round_columns(df)
-    latest = rounds[-1][0]
-    latest_col = f"ROUND {latest}"
-    latest_margin_col = f"ROUND {latest} MARGIN"
-    for c in ["RANK", "TOTAL SCORE", "TOTAL MARGIN", latest_col]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    if latest_margin_col in df.columns:
-        df[latest_margin_col] = pd.to_numeric(df[latest_margin_col], errors="coerce")
-    else:
-        df[latest_margin_col] = None
+        df = pd.read_csv(file)
+        df.columns = [str(c).strip() for c in df.columns]
+        df["Round"] = round_no
+        df["Source File"] = os.path.basename(file)
 
-    ladder = df[["NAME", "RANK", "TOTAL SCORE", "TOTAL MARGIN", latest_col, latest_margin_col]].copy()
-    ladder = ladder.rename(columns={
-        "NAME": "Name",
-        "RANK": "Rank",
-        "TOTAL SCORE": "Total Score",
-        "TOTAL MARGIN": "Total Margin",
-        latest_col: "Round Score",
-        latest_margin_col: "Round Margin",
+        round_frames.append(df)
+
+    if not round_frames:
+        return pd.DataFrame()
+
+    return pd.concat(round_frames, ignore_index=True)
+
+
+@st.cache_data
+def load_teams():
+    team_path = os.path.join(DATA_DIR, "Teams.csv")
+
+    if not os.path.exists(team_path):
+        return pd.DataFrame(columns=["Name", "Team"])
+
+    teams = pd.read_csv(team_path)
+    teams.columns = [str(c).strip() for c in teams.columns]
+
+    name_col = find_column(teams.columns, ["Name", "Entrant", "Player", "Tipper"])
+    team_col = find_column(teams.columns, ["Team", "Group"])
+
+    if name_col is None or team_col is None:
+        return pd.DataFrame(columns=["Name", "Team"])
+
+    teams = teams.rename(columns={
+        name_col: "Name",
+        team_col: "Team"
     })
 
-    prev_round_cols = [c for n, c in rounds if n < latest]
-    if prev_round_cols:
-        prev = df[["NAME"] + prev_round_cols].copy()
-        for c in prev_round_cols:
-            prev[c] = pd.to_numeric(prev[c], errors="coerce").fillna(0)
-        prev["Prev Total"] = prev[prev_round_cols].sum(axis=1)
-        prev = prev.sort_values(["Prev Total", "NAME"], ascending=[False, True]).reset_index(drop=True)
-        prev["Previous Rank"] = prev.index + 1
-        ladder = ladder.merge(prev[["NAME", "Previous Rank"]].rename(columns={"NAME": "Name"}), on="Name", how="left")
-        ladder["Movement"] = ladder["Previous Rank"] - ladder["Rank"]
-    else:
-        ladder["Previous Rank"] = None
-        ladder["Movement"] = 0
+    teams["Name"] = teams["Name"].astype(str).str.strip()
+    teams["Team"] = teams["Team"].astype(str).str.strip()
 
-    ladder = ladder.sort_values("Rank").reset_index(drop=True)
-    return ladder, latest
+    return teams[["Name", "Team"]]
 
-def build_rank_history(df):
-    df = normalise_columns(df)
-    rounds = round_columns(df)
-    history = []
-    cumulative = pd.Series([0] * len(df), index=df.index, dtype="float")
-    for rnd, col in rounds:
-        scores = pd.to_numeric(df[col], errors="coerce").fillna(0)
-        cumulative = cumulative + scores
-        temp = pd.DataFrame({"Name": df["NAME"], "Round": rnd, "Cumulative Score": cumulative})
-        temp = temp.sort_values(["Cumulative Score", "Name"], ascending=[False, True]).reset_index(drop=True)
-        temp["Rank"] = temp.index + 1
-        history.append(temp)
-    return pd.concat(history, ignore_index=True) if history else pd.DataFrame()
 
-def load_team_map():
-    if TEAM_MAP.exists():
-        tm = pd.read_csv(TEAM_MAP)
-        tm.columns = [str(c).strip().upper() for c in tm.columns]
-        if "NAME" in tm.columns and "TEAM" in tm.columns:
-            return tm.rename(columns={"NAME":"Name", "TEAM":"Team"})[["Name", "Team"]]
-    return pd.DataFrame(columns=["Name", "Team"])
+def standardise_data(raw):
+    if raw.empty:
+        return raw
 
-def get_callouts(ladder):
-    tipster = ladder.sort_values(["Round Score", "Round Margin", "Rank"], ascending=[False, True, True]).iloc[0]
-    mover = ladder.sort_values(["Movement", "Rank"], ascending=[False, True]).iloc[0]
-    shooting = ladder.sort_values(["Movement", "Rank"], ascending=[True, True]).iloc[0]
-    middle = ladder[ladder["Rank"] == 26]
-    middle = middle.iloc[0] if not middle.empty else ladder.iloc[len(ladder)//2]
-    return tipster, mover, shooting, middle
+    name_col = find_column(raw.columns, [
+        "Name", "Entrant", "Player", "Tipper", "User", "Username"
+    ])
 
-uploaded = st.sidebar.file_uploader("Upload latest ESPN CSV", type=["csv"])
-if uploaded:
-    raw = pd.read_csv(uploaded)
-    st.sidebar.success("Using uploaded ESPN file")
+    tips_col = find_column(raw.columns, [
+        "Tips", "Correct Tips", "Correct", "Score", "Points", "Total Tips"
+    ])
+
+    margin_col = find_column(raw.columns, [
+        "Margin", "Total Margin", "Margin Total"
+    ])
+
+    if name_col is None:
+        st.error("Could not find a name column in the ESPN CSV files.")
+        st.stop()
+
+    if tips_col is None:
+        st.error("Could not find a tips/correct/points column in the ESPN CSV files.")
+        st.stop()
+
+    if margin_col is None:
+        st.error("Could not find a margin column in the ESPN CSV files.")
+        st.stop()
+
+    df = raw.rename(columns={
+        name_col: "Name",
+        tips_col: "Tips",
+        margin_col: "Margin"
+    }).copy()
+
+    df["Name"] = df["Name"].astype(str).str.strip()
+    df["Tips"] = pd.to_numeric(df["Tips"], errors="coerce").fillna(0)
+    df["Margin"] = pd.to_numeric(df["Margin"], errors="coerce").fillna(999999)
+    df["Round"] = pd.to_numeric(df["Round"], errors="coerce")
+
+    df = df.dropna(subset=["Round"])
+    df["Round"] = df["Round"].astype(int)
+
+    return df
+
+
+def rank_round(df):
+    ranked = df.sort_values(
+        ["Tips", "Margin", "Name"],
+        ascending=[False, True, True]
+    ).copy()
+
+    ranked["Rank"] = range(1, len(ranked) + 1)
+    return ranked
+
+
+def build_rank_history(df_all):
+    frames = []
+
+    for round_no in sorted(df_all["Round"].unique()):
+        round_df = df_all[df_all["Round"] == round_no].copy()
+        ranked = rank_round(round_df)
+        frames.append(ranked)
+
+    return pd.concat(frames, ignore_index=True)
+
+
+# -----------------------------
+# Load data
+# -----------------------------
+
+raw_data = load_round_files()
+teams = load_teams()
+
+if raw_data.empty:
+    st.title("Coho Footy Tipping Dashboard")
+    st.warning("No round CSV files found. Add your ESPN CSV files to the data folder.")
+    st.stop()
+
+df_all = standardise_data(raw_data)
+
+if not teams.empty:
+    df_all = df_all.merge(teams, on="Name", how="left")
 else:
-    raw = load_default_csv()
-    st.sidebar.info("Using bundled Round 6 demo file")
+    df_all["Team"] = "Unassigned"
 
-ladder, latest = build_ladder(raw)
-history = build_rank_history(raw)
-team_map = load_team_map()
-ladder_team = ladder.merge(team_map, on="Name", how="left")
-ladder_team["Team"] = ladder_team["Team"].fillna("Unassigned")
+df_all["Team"] = df_all["Team"].fillna("Unassigned")
 
-tipster, mover, shooting, middle = get_callouts(ladder)
+rank_history = build_rank_history(df_all)
 
-c1, c2, c3, c4 = st.columns(4)
-round_margin_text = int(tipster["Round Margin"]) if pd.notna(tipster["Round Margin"]) else "n/a"
-c1.metric("Tipster of the Round", tipster["Name"], f"{int(tipster['Round Score'])} tips, margin {round_margin_text}")
-c2.metric("Mover & Shaker", mover["Name"], f"+{int(mover['Movement'])} places" if mover["Movement"] > 0 else f"{int(mover['Movement'])} places")
-c3.metric("Shooting Star", shooting["Name"], f"{int(shooting['Movement'])} places")
-c4.metric("Middlest Watch", middle["Name"], "26th place" if int(middle["Rank"]) == 26 else f"Rank {int(middle['Rank'])}")
+available_rounds = sorted(rank_history["Round"].unique())
 
-st.subheader(f"Round {latest} Ladder")
-show_cols = ["Rank", "Name", "Total Score", "Total Margin", "Round Score", "Round Margin", "Previous Rank", "Movement", "Team"]
-st.dataframe(ladder_team[show_cols], use_container_width=True, hide_index=True)
 
-st.subheader("Rank Tracker")
-names = sorted(ladder["Name"].unique())
-default_names = ladder.head(10)["Name"].tolist()
-selected = st.multiselect("Choose entrants to display", names, default=default_names)
-if selected:
-    fig = px.line(history[history["Name"].isin(selected)], x="Round", y="Rank", color="Name", markers=True)
-    fig.update_yaxes(autorange="reversed", title="Rank")
-    fig.update_layout(height=550, legend_title_text="Entrant")
-    st.plotly_chart(fig, use_container_width=True)
-else:
-    st.info("Select at least one entrant to show the rank tracker.")
+# -----------------------------
+# Sidebar
+# -----------------------------
 
-st.subheader("Team Standings")
-team_standings = ladder_team.groupby("Team", as_index=False).agg(
-    Average_Rank=("Rank", "mean"),
-    Total_Score=("Total Score", "sum"),
-    Entrants=("Name", "count"),
+st.sidebar.title("Controls")
+
+selected_round = st.sidebar.selectbox(
+    "Select round",
+    available_rounds,
+    index=len(available_rounds) - 1
 )
-team_standings = team_standings.sort_values(["Average_Rank", "Total_Score"], ascending=[True, False])
-team_standings["Team Rank"] = range(1, len(team_standings) + 1)
-st.dataframe(team_standings[["Team Rank", "Team", "Average_Rank", "Total_Score", "Entrants"]], use_container_width=True, hide_index=True)
 
-if not team_standings.empty:
-    fig_team = px.bar(team_standings, x="Team", y="Average_Rank", text="Average_Rank", title="Team Average Rank")
-    fig_team.update_yaxes(autorange="reversed")
-    st.plotly_chart(fig_team, use_container_width=True)
+selected_names = st.sidebar.multiselect(
+    "Highlight/filter entrants",
+    sorted(rank_history["Name"].unique())
+)
 
-st.subheader("Email Wrap Helper")
-shooting_places = abs(int(shooting["Movement"]))
-wrap = f"""Round {latest} wrap-up:
+show_all = st.sidebar.checkbox("Show all entrants on chart", value=False)
 
-🏆 Tipster of the Round: {tipster['Name']} with {int(tipster['Round Score'])} correct tips and a margin of {round_margin_text}.
-🚀 Mover & Shaker: {mover['Name']} moved {int(mover['Movement'])} places.
-💥 Shooting Star: {shooting['Name']} dropped {shooting_places} places.
-🎯 Middlest Watch: {middle['Name']} is sitting in 26th place.
-"""
-st.text_area("Copy/paste starter text", wrap, height=180)
+uploaded_file = st.sidebar.file_uploader(
+    "Test upload a new ESPN CSV",
+    type=["csv"]
+)
 
-st.caption("Note: previous-round movement is estimated from cumulative round scores where historical margin data is not supplied by ESPN.")
+if uploaded_file is not None:
+    st.sidebar.success(
+        "Upload received for testing. To make it permanent, add the CSV to the GitHub data folder."
+    )
+
+
+# -----------------------------
+# Current round calculations
+# -----------------------------
+
+current = rank_history[rank_history["Round"] == selected_round].copy()
+
+previous = rank_history[rank_history["Round"] == selected_round - 1][
+    ["Name", "Rank"]
+].rename(columns={"Rank": "Previous Rank"})
+
+current = current.merge(previous, on="Name", how="left")
+current["Movement"] = current["Previous Rank"] - current["Rank"]
+
+tipster = current.sort_values(
+    ["Tips", "Margin", "Name"],
+    ascending=[False, True, True]
+).iloc[0]
+
+mover = None
+dropper = None
+
+if selected_round > min(available_rounds) and current["Movement"].notna().any():
+    mover = current.sort_values(
+        ["Movement", "Margin"],
+        ascending=[False, True]
+    ).iloc[0]
+
+    dropper = current.sort_values(
+        ["Movement", "Margin"],
+        ascending=[True, True]
+    ).iloc[0]
+
+middlest = current[current["Rank"] == 26]
+
+
+# -----------------------------
+# Team leaderboard
+# -----------------------------
+
+team_stats = current.groupby("Team", dropna=False).agg(
+    Average_Tips=("Tips", "mean"),
+    Average_Margin=("Margin", "mean"),
+    Participants=("Name", "count")
+).reset_index()
+
+team_stats = team_stats.sort_values(
+    ["Average_Tips", "Average_Margin", "Team"],
+    ascending=[False, True, True]
+)
+
+team_stats["Team Rank"] = range(1, len(team_stats) + 1)
+
+
+# -----------------------------
+# Dashboard
+# -----------------------------
+
+st.title("🏉 Coho Footy Tipping Dashboard")
+st.caption("Auto-generated from ESPN Footy Tips CSV exports")
+
+a, b, c, d = st.columns(4)
+
+a.metric(
+    "Tipster of the Round",
+    tipster["Name"],
+    f'{int(tipster["Tips"])} tips / {int(tipster["Margin"])} margin'
+)
+
+if mover is not None:
+    b.metric(
+        "Mover & Shaker",
+        mover["Name"],
+        f'+{int(mover["Movement"])} places'
+    )
+else:
+    b.metric("Mover & Shaker", "N/A")
+
+if dropper is not None:
+    c.metric(
+        "Shooting Star",
+        dropper["Name"],
+        f'{int(dropper["Movement"])} places'
+    )
+else:
+    c.metric("Shooting Star", "N/A")
+
+if not middlest.empty:
+    d.metric("Middlest Watch", middlest.iloc[0]["Name"], "26th place")
+else:
+    d.metric("Middlest Watch", "N/A")
+
+
+st.divider()
+
+# -----------------------------
+# Charts
+# -----------------------------
+
+st.subheader("Rank Tracking")
+
+if show_all:
+    chart_data = rank_history.copy()
+elif selected_names:
+    chart_data = rank_history[rank_history["Name"].isin(selected_names)].copy()
+else:
+    top_10_names = current.head(10)["Name"].tolist()
+    chart_data = rank_history[rank_history["Name"].isin(top_10_names)].copy()
+    st.info("Showing current top 10 by default. Select names in the sidebar or tick Show all entrants.")
+
+fig = px.line(
+    chart_data,
+    x="Round",
+    y="Rank",
+    color="Name",
+    markers=True,
+    hover_data=["Tips", "Margin", "Team"]
+)
+
+fig.update_yaxes(autorange="reversed", title="Rank")
+fig.update_xaxes(dtick=1)
+fig.update_layout(height=600)
+
+st.plotly_chart(fig, use_container_width=True)
+
+
+# -----------------------------
+# Tables
+# -----------------------------
+
+left, right = st.columns(2)
+
+with left:
+    st.subheader(f"Round {selected_round} Leaderboard")
+    display_current = current.sort_values("Rank")[
+        ["Rank", "Name", "Tips", "Margin", "Movement", "Team"]
+    ]
+
+    st.dataframe(display_current, use_container_width=True, hide_index=True)
+
+with right:
+    st.subheader(f"Round {selected_round} Team Leaderboard")
+    display_teams = team_stats[
+        ["Team Rank", "Team", "Average_Tips", "Average_Margin", "Participants"]
+    ].copy()
+
+    display_teams["Average_Tips"] = display_teams["Average_Tips"].round(2)
+    display_teams["Average_Margin"] = display_teams["Average_Margin"].round(2)
+
+    st.dataframe(display_teams, use_container_width=True, hide_index=True)
+
+
+st.divider()
+
+st.subheader("Weekly Email Summary")
+
+summary_lines = [
+    f"Round {selected_round} wrap-up:",
+    f"🏆 Tipster of the Round: {tipster['Name']} with {int(tipster['Tips'])} tips and a margin of {int(tipster['Margin'])}.",
+]
+
+if mover is not None:
+    summary_lines.append(
+        f"🚀 Mover & Shaker: {mover['Name']} climbed {int(mover['Movement'])} places."
+    )
+
+if dropper is not None:
+    summary_lines.append(
+        f"💫 Shooting Star: {dropper['Name']} dropped {abs(int(dropper['Movement']))} places."
+    )
+
+if not middlest.empty:
+    summary_lines.append(
+        f"🎯 Middlest Watch: {middlest.iloc[0]['Name']} is currently sitting in 26th place."
+    )
+
+if not team_stats.empty:
+    top_team = team_stats.iloc[0]
+    summary_lines.append(
+        f"🏉 Top Team: {top_team['Team']} leads the teams with an average of {top_team['Average_Tips']:.2f} tips."
+    )
+
+st.text_area(
+    "Copy/paste summary",
+    "\n".join(summary_lines),
+    height=180
+)
