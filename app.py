@@ -2,7 +2,7 @@ import base64
 import glob
 import os
 import re
-from pathlib import Path
+from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -12,394 +12,417 @@ import streamlit as st
 
 st.set_page_config(page_title="Coho Footy Tipping Dashboard", layout="wide")
 
-DATA_DIR = Path("data")
-UPLOAD_PASSWORD = "C@H@"
+DATA_DIR = "data"
+ADMIN_PASSWORD = "C@H@"
 
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 2.25rem; padding-bottom: 2rem; max-width: 1400px;}
+    h1 {line-height: 1.15 !important; padding-top: 0.2rem; margin-top: 0 !important;}
+    h2, h3 {line-height: 1.2 !important;}
+    [data-testid="stMetricValue"] {font-size: 1.5rem;}
+    .stDataFrame {width: 100%;}
+    @media (max-width: 800px) {
+      .block-container {padding-left: 0.75rem; padding-right: 0.75rem; padding-top: 1.5rem;}
+      [data-testid="stMetricValue"] {font-size: 1.15rem;}
+      h1 {font-size: 1.8rem !important;}
+      h2 {font-size: 1.35rem !important;}
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -----------------------------
+# Helpers
+# -----------------------------
 
 def extract_round_number(filename: str):
-    """Detect round number from ESPN filename. For finals, continue with the next round number."""
-    m = re.search(r"nrl-(\d+)", filename.lower())
-    return int(m.group(1)) if m else None
+    match = re.search(r"nrl-(\d+)", filename.lower())
+    return int(match.group(1)) if match else None
 
 
-def find_column(columns, exact_options=None, contains_options=None):
-    exact_options = exact_options or []
-    contains_options = contains_options or []
-    lookup = {str(c).strip().lower(): c for c in columns}
-    for opt in exact_options:
-        if opt.lower() in lookup:
-            return lookup[opt.lower()]
+def find_column(columns, possible_names):
+    cleaned = {str(c).strip().lower(): c for c in columns}
+    for name in possible_names:
+        if name.lower() in cleaned:
+            return cleaned[name.lower()]
     for c in columns:
-        c_low = str(c).strip().lower()
-        for opt in contains_options:
-            if opt.lower() in c_low:
+        c_lower = str(c).strip().lower()
+        for name in possible_names:
+            if name.lower() in c_lower:
                 return c
     return None
 
 
-def round_tip_columns(columns):
-    found = []
-    for c in columns:
-        m = re.fullmatch(r"ROUND\s+(\d+)", str(c).strip(), re.I)
-        if m:
-            found.append((int(m.group(1)), c))
-    return sorted(found)
+def round_col(df, round_no, margin=False):
+    target = f"ROUND {round_no} MARGIN" if margin else f"ROUND {round_no}"
+    for c in df.columns:
+        if str(c).strip().upper() == target:
+            return c
+    return None
 
 
-def round_margin_columns(columns):
-    found = []
-    for c in columns:
-        m = re.fullmatch(r"ROUND\s+(\d+)\s+MARGIN", str(c).strip(), re.I)
-        if m:
-            found.append((int(m.group(1)), c))
-    return sorted(found)
+@st.cache_data(ttl=30)
+def load_round_files():
+    pattern = os.path.join(DATA_DIR, "competition-Coho Footy Tipping-nrl-*.csv")
+    files = glob.glob(pattern)
+    by_round = {}
+    for file in files:
+        r = extract_round_number(os.path.basename(file))
+        if r is None:
+            continue
+        # If duplicates exist, prefer the file without brackets in the name, otherwise the newest modified file.
+        current = by_round.get(r)
+        if current is None:
+            by_round[r] = file
+        else:
+            cur_base = os.path.basename(current)
+            new_base = os.path.basename(file)
+            if "(" in cur_base and "(" not in new_base:
+                by_round[r] = file
+            elif os.path.getmtime(file) > os.path.getmtime(current) and ("(" in new_base) == ("(" in cur_base):
+                by_round[r] = file
+
+    snapshots = []
+    for r, file in sorted(by_round.items()):
+        df = pd.read_csv(file)
+        df.columns = [str(c).strip() for c in df.columns]
+        name_col = find_column(df.columns, ["NAME", "Name", "Entrant", "Player", "Tipper"])
+        if name_col is None:
+            continue
+        df["Name"] = df[name_col].astype(str).str.strip()
+        df["Round"] = r
+        df["Source File"] = os.path.basename(file)
+
+        rank_c = find_column(df.columns, ["RANK", "Rank"])
+        total_score_c = find_column(df.columns, ["TOTAL SCORE", "Total Score", "Total Tips", "Score"])
+        total_margin_c = find_column(df.columns, ["TOTAL MARGIN", "Total Margin"])
+        wk_score_c = round_col(df, r, margin=False)
+        wk_margin_c = round_col(df, r, margin=True)
+
+        df["Official Rank"] = pd.to_numeric(df[rank_c], errors="coerce") if rank_c else None
+        df["Round Tips"] = pd.to_numeric(df[wk_score_c], errors="coerce") if wk_score_c else 0
+        df["Round Margin"] = pd.to_numeric(df[wk_margin_c], errors="coerce") if wk_margin_c else 0
+        df["Total Tips File"] = pd.to_numeric(df[total_score_c], errors="coerce") if total_score_c else None
+        df["Total Margin File"] = pd.to_numeric(df[total_margin_c], errors="coerce") if total_margin_c else None
+        snapshots.append(df[["Name", "Round", "Source File", "Official Rank", "Round Tips", "Round Margin", "Total Tips File", "Total Margin File"]])
+
+    if not snapshots:
+        return pd.DataFrame()
+    return pd.concat(snapshots, ignore_index=True)
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=30)
 def load_teams():
-    path = DATA_DIR / "Teams.csv"
-    if not path.exists():
+    team_path = os.path.join(DATA_DIR, "Teams.csv")
+    if not os.path.exists(team_path):
         return pd.DataFrame(columns=["Name", "Team"])
-
-    teams = pd.read_csv(path)
+    teams = pd.read_csv(team_path)
     teams.columns = [str(c).strip() for c in teams.columns]
-
     name_col = find_column(teams.columns, ["Name", "NAME", "Entrant", "Player", "Tipper"])
     team_col = find_column(teams.columns, ["Team", "TEAM", "Group"])
-
     if name_col is None or team_col is None:
         return pd.DataFrame(columns=["Name", "Team"])
-
     teams = teams.rename(columns={name_col: "Name", team_col: "Team"})
     teams["Name"] = teams["Name"].astype(str).str.strip()
     teams["Team"] = teams["Team"].astype(str).str.strip()
     return teams[["Name", "Team"]].drop_duplicates()
 
 
-@st.cache_data(ttl=60)
-def load_all_rounds():
-    """
-    Loads every ESPN CSV in /data and builds one row per entrant per round.
-    ESPN adds columns each week, so this does not rely on a fixed schema.
-    """
-    files = sorted(glob.glob(str(DATA_DIR / "competition-Coho Footy Tipping-nrl-*.csv")))
-    weekly_rows = []
-    skipped = []
+def build_history(raw):
+    if raw.empty:
+        return raw
+    rows = []
+    names = sorted(raw["Name"].unique(), key=lambda x: x.lower())
+    rounds = sorted(raw["Round"].unique())
+    running = {name: {"tips": 0.0, "margin": 0.0} for name in names}
 
-    for file in files:
-        filename = os.path.basename(file)
-        file_round = extract_round_number(filename)
-        if file_round is None:
-            skipped.append(filename)
-            continue
+    for r in rounds:
+        rd = raw[raw["Round"] == r].copy()
+        for _, row in rd.iterrows():
+            name = row["Name"]
+            wk_tips = pd.to_numeric(row["Round Tips"], errors="coerce")
+            wk_margin = pd.to_numeric(row["Round Margin"], errors="coerce")
+            wk_tips = 0 if pd.isna(wk_tips) else float(wk_tips)
+            wk_margin = 0 if pd.isna(wk_margin) else float(wk_margin)
 
-        raw = pd.read_csv(file)
-        raw.columns = [str(c).strip() for c in raw.columns]
-        name_col = find_column(raw.columns, ["NAME", "Name", "Entrant", "Player", "Tipper"])
+            running.setdefault(name, {"tips": 0.0, "margin": 0.0})
+            running[name]["tips"] += wk_tips
+            running[name]["margin"] += wk_margin
 
-        if name_col is None:
-            skipped.append(filename)
-            continue
+            total_tips_file = row.get("Total Tips File")
+            total_margin_file = row.get("Total Margin File")
+            total_tips = running[name]["tips"] if pd.isna(total_tips_file) else float(total_tips_file)
+            total_margin = running[name]["margin"] if pd.isna(total_margin_file) else float(total_margin_file)
+            # Keep the running values aligned to official totals where available.
+            running[name]["tips"] = total_tips
+            running[name]["margin"] = total_margin
 
-        tips_col = find_column(raw.columns, [f"ROUND {file_round}", f"Round {file_round}"])
-        margin_col = find_column(raw.columns, [f"ROUND {file_round} MARGIN", f"Round {file_round} Margin"])
-
-        if tips_col is None:
-            tips_found = round_tip_columns(raw.columns)
-            tips_col = tips_found[-1][1] if tips_found else None
-            file_round = tips_found[-1][0] if tips_found else file_round
-
-        if margin_col is None:
-            margin_found = round_margin_columns(raw.columns)
-            margin_col = margin_found[-1][1] if margin_found else None
-
-        if tips_col is None:
-            skipped.append(filename)
-            continue
-
-        out = pd.DataFrame({
-            "Name": raw[name_col].astype(str).str.strip(),
-            "Round": int(file_round),
-            "Round Tips": pd.to_numeric(raw[tips_col], errors="coerce").fillna(0),
-            "Round Margin": pd.to_numeric(raw[margin_col], errors="coerce").fillna(0) if margin_col is not None else 0,
-            "Source File": filename,
-        })
-        weekly_rows.append(out)
-
-    if not weekly_rows:
-        return pd.DataFrame(), skipped
-
-    weekly = pd.concat(weekly_rows, ignore_index=True)
-    weekly = weekly.drop_duplicates(subset=["Name", "Round"], keep="last")
-
-    names = sorted(weekly["Name"].unique(), key=lambda x: str(x).lower())
-    rounds = sorted(weekly["Round"].unique())
-    grid = pd.MultiIndex.from_product([names, rounds], names=["Name", "Round"]).to_frame(index=False)
-    full = grid.merge(weekly, on=["Name", "Round"], how="left")
-    full["Round Tips"] = pd.to_numeric(full["Round Tips"], errors="coerce").fillna(0)
-    full["Round Margin"] = pd.to_numeric(full["Round Margin"], errors="coerce").fillna(0)
-    full["Source File"] = full["Source File"].fillna("")
-
-    full = full.sort_values(["Name", "Round"])
-    full["Total Score"] = full.groupby("Name")["Round Tips"].cumsum()
-    full["Total Margin"] = full.groupby("Name")["Round Margin"].cumsum()
-
-    ranked_frames = []
-    for round_no in rounds:
-        r = full[full["Round"] == round_no].copy()
-        r = r.sort_values(["Total Score", "Total Margin", "Name"], ascending=[False, True, True])
-        r["Rank"] = range(1, len(r) + 1)
-        ranked_frames.append(r)
-
-    data = pd.concat(ranked_frames, ignore_index=True)
-    return data, skipped
+            rows.append({
+                "Name": name,
+                "Round": int(r),
+                "Round Tips": wk_tips,
+                "Round Margin": wk_margin,
+                "Total Tips": total_tips,
+                "Total Margin": total_margin,
+                "Source File": row.get("Source File", ""),
+            })
+    hist = pd.DataFrame(rows)
+    return rank_all_rounds(hist)
 
 
-def get_secret_value(*names, default=None):
-    for name in names:
-        try:
-            cur = st.secrets
-            for part in name.split('.'):
-                cur = cur[part]
-            if cur:
-                return cur
-        except Exception:
-            pass
-    return default
+def rank_all_rounds(hist):
+    frames = []
+    for r in sorted(hist["Round"].unique()):
+        rd = hist[hist["Round"] == r].copy()
+        rd = rd.sort_values(["Total Tips", "Total Margin", "Name"], ascending=[False, True, True])
+        rd["Rank"] = range(1, len(rd) + 1)
+        frames.append(rd)
+    return pd.concat(frames, ignore_index=True)
 
 
-def upload_csv_to_github(uploaded_file, round_number: int):
-    token = get_secret_value('GITHUB_TOKEN', 'github.token')
-    repo = get_secret_value('REPO_NAME', 'github.repo')
-    branch = get_secret_value('GITHUB_BRANCH', 'github.branch', default='main')
-    data_path = get_secret_value('GITHUB_DATA_PATH', 'github.data_path', default='data')
+def commit_file_to_github(uploaded_file, target_name):
+    token = st.secrets.get("GITHUB_TOKEN", None)
+    repo_name = st.secrets.get("REPO_NAME", None)
+    if not token or not repo_name:
+        raise RuntimeError("Missing GITHUB_TOKEN or REPO_NAME in Streamlit Secrets.")
 
-    if not token or not repo:
-        return False, 'GitHub upload is not configured. In Streamlit Secrets add GITHUB_TOKEN and REPO_NAME.'
-    if uploaded_file is None:
-        return False, 'Choose a CSV file first.'
-    if not uploaded_file.name.lower().endswith('.csv'):
-        return False, 'Only CSV files can be uploaded.'
-
-    safe_round = int(round_number)
-    filename = f'competition-Coho Footy Tipping-nrl-{safe_round}.csv'
     content_bytes = uploaded_file.getvalue()
-    if not content_bytes:
-        return False, 'The uploaded file looks empty.'
-
-    encoded = base64.b64encode(content_bytes).decode('utf-8')
-    repo_path = f'{data_path}/{filename}'
-    url = f'https://api.github.com/repos/{repo}/contents/{repo_path}'
-    headers = {
-        'Authorization': f'Bearer {token}',
-        'Accept': 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-    }
+    encoded = base64.b64encode(content_bytes).decode("utf-8")
+    path = f"data/{target_name}"
+    url = f"https://api.github.com/repos/{repo_name}/contents/{path}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
 
     sha = None
-    existing = requests.get(url, headers=headers, params={'ref': branch}, timeout=20)
+    existing = requests.get(url, headers=headers, timeout=20)
     if existing.status_code == 200:
-        sha = existing.json().get('sha')
-    elif existing.status_code != 404:
-        return False, f'Could not check existing file: {existing.status_code} - {existing.text[:300]}'
+        sha = existing.json().get("sha")
+    elif existing.status_code not in (404,):
+        raise RuntimeError(f"GitHub lookup failed: {existing.status_code} {existing.text}")
 
     payload = {
-        'message': f'Add/update Coho tipping data for round {safe_round}',
-        'content': encoded,
-        'branch': branch,
+        "message": f"Add/update tipping data {target_name}",
+        "content": encoded,
+        "branch": "main",
     }
     if sha:
-        payload['sha'] = sha
+        payload["sha"] = sha
 
     response = requests.put(url, headers=headers, json=payload, timeout=30)
-    if response.status_code in (200, 201):
-        st.cache_data.clear()
-        return True, f'Uploaded {filename} to GitHub. Streamlit will redeploy automatically. Refresh in about 30-60 seconds.'
-
-    return False, f'GitHub upload failed: {response.status_code} - {response.text[:500]}'
+    if response.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub upload failed: {response.status_code} {response.text}")
+    return response.json()
 
 
-raw_data, skipped_files = load_all_rounds()
-teams = load_teams()
+def fmt_int(v):
+    try:
+        return f"{int(round(float(v)))}"
+    except Exception:
+        return "0"
 
-st.title("🏉 Coho Footy Tipping Dashboard")
-
-st.markdown("""
-<style>
-    .block-container {padding-top: 1.2rem; padding-left: 1rem; padding-right: 1rem; max-width: 1500px;}
-    div[data-testid="stMetric"] {background: rgba(250,250,250,0.03); padding: 0.6rem; border-radius: 0.6rem;}
-    .stDataFrame {width: 100%;}
-    @media (max-width: 900px) {
-        section.main .block-container {padding-left: 0.5rem; padding-right: 0.5rem;}
-        div[data-testid="column"] {width: 100% !important; flex: 1 1 100% !important; min-width: 100% !important;}
-        div[data-testid="stHorizontalBlock"] {flex-wrap: wrap !important;}
-        .stDataFrame {font-size: 0.82rem;}
-        h1 {font-size: 1.55rem !important;}
-        h2, h3 {font-size: 1.15rem !important;}
-    }
-</style>
-""", unsafe_allow_html=True)
-
-if raw_data.empty:
-    st.warning("No ESPN round CSV files found in the data folder.")
+# -----------------------------
+# Load and prepare data
+# -----------------------------
+raw = load_round_files()
+if raw.empty:
+    st.title("🏉 Coho Footy Tipping Dashboard")
+    st.warning("No round CSV files found. Add your ESPN CSV files to the data folder.")
     st.stop()
 
+teams = load_teams()
+history = build_history(raw)
 if not teams.empty:
-    data = raw_data.merge(teams, on="Name", how="left")
-else:
-    data = raw_data.copy()
-    data["Team"] = "Unassigned"
+    history = history.merge(teams, on="Name", how="left")
+history["Team"] = history.get("Team", "Unassigned").fillna("Unassigned")
 
-data["Team"] = data["Team"].fillna("Unassigned")
-rounds = sorted(data["Round"].unique())
-entrants = sorted(data["Name"].unique(), key=lambda x: str(x).lower())
-teams_available = sorted([t for t in data["Team"].dropna().unique()], key=lambda x: str(x).lower())
+available_rounds = sorted(history["Round"].unique())
+latest_round = max(available_rounds)
+entrant_count = history[history["Round"] == latest_round]["Name"].nunique()
 
+# -----------------------------
+# Sidebar controls
+# -----------------------------
 st.sidebar.title("Controls")
-selected_round = st.sidebar.selectbox("Select round", rounds, index=len(rounds) - 1)
-highlight_names = st.sidebar.multiselect("Highlight entrants", entrants)
-highlight_teams = st.sidebar.multiselect("Highlight teams", teams_available)
-show_all = st.sidebar.checkbox("Show all entrants", value=True)
+selected_round = st.sidebar.select_slider("Round", options=available_rounds, value=latest_round)
 
-st.sidebar.divider()
-st.sidebar.subheader("Admin upload")
-st.sidebar.caption("Upload a new ESPN CSV and save it into the GitHub data folder.")
-admin_password = st.sidebar.text_input("Upload password", type="password")
-next_round = int(max(rounds) + 1) if rounds else 1
-upload_round = st.sidebar.number_input(
-    "Save as round number",
-    min_value=1,
-    max_value=60,
-    value=next_round,
-    step=1,
-    help="Use the next NRL round number. For finals, continue numbering after the regular season.",
-)
-new_file = st.sidebar.file_uploader("Choose ESPN CSV", type=["csv"])
-if st.sidebar.button("Upload CSV to GitHub", type="primary"):
-    if admin_password != UPLOAD_PASSWORD:
-        st.sidebar.error("Incorrect password.")
-    else:
-        ok, msg = upload_csv_to_github(new_file, upload_round)
-        (st.sidebar.success if ok else st.sidebar.error)(msg)
+all_names = sorted(history["Name"].unique(), key=lambda x: x.lower())
+selected_names = st.sidebar.multiselect("Highlight entrants", all_names, default=[])
+team_options = sorted([t for t in history["Team"].dropna().unique() if t != "Unassigned"], key=lambda x: x.lower())
+selected_teams = st.sidebar.multiselect("Highlight team members", team_options, default=[])
 
-if skipped_files:
-    st.sidebar.warning("Some files were skipped: " + ", ".join(skipped_files))
+with st.sidebar.expander("Admin: upload new round CSV", expanded=False):
+    password = st.text_input("Admin password", type="password", key="admin_password")
+    uploaded_file = st.file_uploader("Upload ESPN CSV to GitHub data folder", type=["csv"], key="github_upload")
+    if uploaded_file is not None:
+        if password != ADMIN_PASSWORD:
+            st.error("Incorrect password.")
+        else:
+            safe_name = os.path.basename(uploaded_file.name).replace(" ", " ")
+            if not re.search(r"nrl-\d+", safe_name.lower()):
+                st.error("Filename must include the round number, for example competition-Coho Footy Tipping-nrl-9.csv")
+            else:
+                if st.button("Commit uploaded CSV to GitHub", type="primary"):
+                    try:
+                        commit_file_to_github(uploaded_file, safe_name)
+                        st.success(f"Uploaded {safe_name} to GitHub. Streamlit should redeploy shortly.")
+                        st.cache_data.clear()
+                    except Exception as exc:
+                        st.error(str(exc))
 
-current = data[data["Round"] == selected_round].copy().sort_values("Rank")
-previous = data[data["Round"] == selected_round - 1][["Name", "Rank"]].rename(columns={"Rank": "Previous Rank"})
-current = current.merge(previous, on="Name", how="left")
+# -----------------------------
+# Current round data
+# -----------------------------
+current = history[history["Round"] == selected_round].copy().sort_values("Rank")
+prev = history[history["Round"] == selected_round - 1][["Name", "Rank"]].rename(columns={"Rank": "Previous Rank"})
+current = current.merge(prev, on="Name", how="left")
 current["Movement"] = current["Previous Rank"] - current["Rank"]
 
 tipster = current.sort_values(["Round Tips", "Round Margin", "Name"], ascending=[False, True, True]).iloc[0]
-if current["Movement"].notna().any():
-    mover = current.sort_values(["Movement", "Round Margin"], ascending=[False, True]).iloc[0]
-    dropper = current.sort_values(["Movement", "Round Margin"], ascending=[True, True]).iloc[0]
-else:
-    mover = dropper = None
+mover = current[current["Movement"].notna()].sort_values(["Movement", "Round Margin"], ascending=[False, True]).head(1)
+dropper = current[current["Movement"].notna()].sort_values(["Movement", "Round Margin"], ascending=[True, True]).head(1)
 middlest = current[current["Rank"] == 26]
 
 team_stats = current.groupby("Team", dropna=False).agg(
-    Average_Total_Tips=("Total Score", "mean"),
-    Average_Total_Margin=("Total Margin", "mean"),
+    Avg_Total_Tips=("Total Tips", "mean"),
+    Avg_Total_Margin=("Total Margin", "mean"),
     Participants=("Name", "count"),
-).reset_index().sort_values(["Average_Total_Tips", "Average_Total_Margin", "Team"], ascending=[False, True, True])
+).reset_index()
+team_stats = team_stats.sort_values(["Avg_Total_Tips", "Avg_Total_Margin", "Team"], ascending=[False, True, True])
 team_stats["Team Rank"] = range(1, len(team_stats) + 1)
 
-a, b, c, d = st.columns(4)
-a.metric("Tipster of the Round", tipster["Name"], f'{int(tipster["Round Tips"])} tips / {int(tipster["Round Margin"])} margin')
-if mover is not None:
-    b.metric("Mover & Shaker", mover["Name"], f'+{int(mover["Movement"])} places')
+# -----------------------------
+# Header and metrics
+# -----------------------------
+st.title("🏉 Coho Footy Tipping Dashboard")
+
+metric_cols = st.columns(4)
+metric_cols[0].metric("Tipster of the Round", tipster["Name"], f"{fmt_int(tipster['Round Tips'])} tips / {fmt_int(tipster['Round Margin'])} margin")
+if not mover.empty:
+    metric_cols[1].metric("Mover & Shaker", mover.iloc[0]["Name"], f"+{fmt_int(mover.iloc[0]['Movement'])} places")
 else:
-    b.metric("Mover & Shaker", "N/A")
-if dropper is not None:
-    c.metric("Shooting Star", dropper["Name"], f'{int(dropper["Movement"])} places')
+    metric_cols[1].metric("Mover & Shaker", "N/A")
+if not dropper.empty:
+    metric_cols[2].metric("Shooting Star", dropper.iloc[0]["Name"], f"{fmt_int(dropper.iloc[0]['Movement'])} places")
 else:
-    c.metric("Shooting Star", "N/A")
+    metric_cols[2].metric("Shooting Star", "N/A")
 if not middlest.empty:
-    d.metric("Middlest Watch", middlest.iloc[0]["Name"], "26th place")
+    metric_cols[3].metric("Middlest Watch", middlest.iloc[0]["Name"], "26th place")
 else:
-    d.metric("Middlest Watch", "N/A")
+    metric_cols[3].metric("Middlest Watch", "N/A")
 
 st.divider()
 
+# -----------------------------
+# Rank chart with highlighting
+# -----------------------------
 st.subheader("Rank Tracking")
-team_highlight_names = set(data[data["Team"].isin(highlight_teams)]["Name"].unique())
-all_highlight_names = set(highlight_names) | team_highlight_names
-
-if show_all:
-    chart_names = entrants
-elif all_highlight_names:
-    chart_names = sorted(all_highlight_names, key=lambda x: str(x).lower())
-else:
-    chart_names = sorted(current.head(10)["Name"].tolist(), key=lambda x: str(x).lower())
-    st.info("Showing current top 10. Tick 'Show all entrants' or choose highlights in the sidebar.")
+team_highlight_names = set(history[history["Team"].isin(selected_teams)]["Name"].unique())
+highlight_names = set(selected_names) | team_highlight_names
 
 fig = go.Figure()
-for name in chart_names:
-    person = data[data["Name"] == name].sort_values("Round")
-    is_highlight = name in all_highlight_names
-    if all_highlight_names:
-        width = 6 if is_highlight else 1.2
-        opacity = 1.0 if is_highlight else 0.22
-        marker_size = 11 if is_highlight else 4
-    else:
-        width = 2
-        opacity = 0.85
-        marker_size = 5
+for name in all_names:
+    person = history[history["Name"] == name].sort_values("Round")
+    is_highlighted = name in highlight_names
     fig.add_trace(go.Scatter(
         x=person["Round"],
         y=person["Rank"],
         mode="lines+markers",
         name=name,
-        line={"width": width},
-        marker={"size": marker_size, "line": {"width": 2 if is_highlight else 0}},
-        opacity=opacity,
-        customdata=person[["Round Tips", "Round Margin", "Total Score", "Total Margin", "Team"]],
-        hovertemplate=(
-            "%{fullData.name}<br>Round %{x}<br>Rank %{y}"
-            "<br>Round tips %{customdata[0]}<br>Round margin %{customdata[1]}"
-            "<br>Total tips %{customdata[2]}<br>Total margin %{customdata[3]}"
-            "<br>Team %{customdata[4]}<extra></extra>"
-        ),
+        line=dict(width=5 if is_highlighted else 1.5),
+        marker=dict(size=8 if is_highlighted else 4),
+        opacity=1.0 if (not highlight_names or is_highlighted) else 0.22,
+        hovertemplate="%{fullData.name}<br>Round %{x}<br>Rank %{y}<extra></extra>",
     ))
-fig.update_yaxes(autorange="reversed", title="Rank")
-fig.update_xaxes(dtick=1, title="Round")
-fig.update_layout(height=650, legend_title_text="Entrant", legend_traceorder="normal")
+fig.update_yaxes(title="Rank", range=[entrant_count + 1, 0], fixedrange=True, autorange=False)
+fig.update_xaxes(title="Round", dtick=1, fixedrange=True)
+fig.update_layout(height=640, legend_title="Entrant", hovermode="closest")
 st.plotly_chart(fig, use_container_width=True)
 
+# -----------------------------
+# Movement bar chart
+# -----------------------------
 st.subheader("Round Movement — Biggest Climbers and Fallers")
-movement_chart = current.dropna(subset=["Movement"]).copy()
-if movement_chart.empty:
-    st.info("Movement chart will appear from Round 2 onwards.")
-else:
-    movement_chart = movement_chart.sort_values("Movement", ascending=True)
+movement_data = current[current["Movement"].notna()].copy()
+if not movement_data.empty:
+    climbers = movement_data.sort_values("Movement", ascending=False).head(10)
+    fallers = movement_data.sort_values("Movement", ascending=True).head(10)
+    movement_plot = pd.concat([climbers, fallers]).drop_duplicates(subset=["Name"])
+    movement_plot = movement_plot.sort_values("Movement", ascending=True)
     bar = px.bar(
-        movement_chart,
+        movement_plot,
         x="Movement",
         y="Name",
         orientation="h",
         color="Movement",
         color_continuous_scale="Plasma",
-        hover_data=["Rank", "Previous Rank", "Round Tips", "Round Margin", "Total Score", "Total Margin", "Team"],
         labels={"Movement": "Rank Change", "Name": ""},
+        hover_data=["Rank", "Previous Rank", "Total Tips", "Total Margin"],
     )
-    bar.update_layout(height=max(650, 22 * len(movement_chart)), coloraxis_colorbar_title="Rank Change")
+    bar.update_layout(height=max(500, 24 * len(movement_plot)), coloraxis_colorbar_title="Rank Change")
     st.plotly_chart(bar, use_container_width=True)
+else:
+    st.info("Movement data starts from Round 2.")
 
+# -----------------------------
+# Leaderboards stacked vertically
+# -----------------------------
 st.subheader(f"Round {selected_round} Leaderboard")
-display_current = current.sort_values("Rank")[[
-    "Rank", "Name", "Round Tips", "Round Margin", "Total Score", "Total Margin", "Movement", "Team"
-]].rename(columns={
-    "Total Score": "Total Tips",
-})
-st.dataframe(display_current, use_container_width=True, hide_index=True, height=520)
+leaderboard = current.sort_values("Rank")[["Rank", "Name", "Round Tips", "Round Margin", "Total Tips", "Total Margin", "Movement", "Team"]].copy()
+for c in ["Round Tips", "Round Margin", "Total Tips", "Total Margin", "Movement"]:
+    leaderboard[c] = leaderboard[c].round(0).astype("Int64")
+st.dataframe(leaderboard, use_container_width=True, hide_index=True, height=420)
 
 st.subheader(f"Round {selected_round} Team Leaderboard — Season Total Average")
-display_teams = team_stats[["Team Rank", "Team", "Average_Total_Tips", "Average_Total_Margin", "Participants"]].copy()
-display_teams = display_teams.rename(columns={
-    "Average_Total_Tips": "Avg Total Tips",
-    "Average_Total_Margin": "Avg Total Margin",
-})
-display_teams["Avg Total Tips"] = display_teams["Avg Total Tips"].round(2)
-display_teams["Avg Total Margin"] = display_teams["Avg Total Margin"].round(2)
-st.dataframe(display_teams, use_container_width=True, hide_index=True, height=420)
+team_display = team_stats[["Team Rank", "Team", "Avg_Total_Tips", "Avg_Total_Margin", "Participants"]].copy()
+team_display["Avg_Total_Tips"] = team_display["Avg_Total_Tips"].round(2)
+team_display["Avg_Total_Margin"] = team_display["Avg_Total_Margin"].round(2)
+st.dataframe(team_display, use_container_width=True, hide_index=True)
+
+st.divider()
+
+# -----------------------------
+# Added insights
+# -----------------------------
+st.header("Season Insights")
+
+st.subheader("Weeks Spent in the Lead")
+leaders = history.loc[history.groupby("Round")["Rank"].idxmin()].copy()
+weeks_lead = leaders.groupby("Name").size().reset_index(name="Weeks in Lead").sort_values(["Weeks in Lead", "Name"], ascending=[False, True])
+lead_fig = px.bar(weeks_lead, x="Weeks in Lead", y="Name", orientation="h", labels={"Name": "", "Weeks in Lead": "Weeks in 1st"})
+lead_fig.update_layout(height=max(340, 34 * len(weeks_lead)))
+st.plotly_chart(lead_fig, use_container_width=True)
+
+st.subheader("Consistency Ladder")
+cons = history.sort_values(["Name", "Round"]).copy()
+cons["Rank Change Abs"] = cons.groupby("Name")["Rank"].diff().abs()
+consistency = cons.groupby("Name").agg(
+    Avg_Rank_Movement=("Rank Change Abs", "mean"),
+    Best_Rank=("Rank", "min"),
+    Worst_Rank=("Rank", "max"),
+).reset_index()
+consistency["Avg_Rank_Movement"] = consistency["Avg_Rank_Movement"].fillna(0).round(2)
+consistency = consistency.sort_values(["Avg_Rank_Movement", "Best_Rank", "Name"]).head(20)
+cons_fig = px.bar(consistency.sort_values("Avg_Rank_Movement", ascending=False), x="Avg_Rank_Movement", y="Name", orientation="h", labels={"Avg_Rank_Movement": "Average rank movement per round", "Name": ""})
+cons_fig.update_layout(height=max(500, 24 * len(consistency)))
+st.plotly_chart(cons_fig, use_container_width=True)
+
+st.subheader("Form Guide — Last 3 Rounds")
+last_rounds = [r for r in available_rounds if r <= selected_round][-3:]
+form = history[history["Round"].isin(last_rounds)].groupby("Name").agg(
+    Last_3_Tips=("Round Tips", "sum"),
+    Last_3_Margin=("Round Margin", "sum"),
+).reset_index()
+form = form.sort_values(["Last_3_Tips", "Last_3_Margin", "Name"], ascending=[False, True, True]).head(20)
+form_fig = px.bar(form.sort_values("Last_3_Tips", ascending=True), x="Last_3_Tips", y="Name", orientation="h", hover_data=["Last_3_Margin"], labels={"Last_3_Tips": "Tips in last 3 rounds", "Name": ""})
+form_fig.update_layout(height=max(500, 24 * len(form)))
+st.plotly_chart(form_fig, use_container_width=True)
+
+st.subheader("Team Momentum — Average Total Tips by Round")
+team_round = history.groupby(["Round", "Team"], dropna=False).agg(Avg_Total_Tips=("Total Tips", "mean")).reset_index()
+team_round = team_round.sort_values(["Team", "Round"])
+team_momentum = px.line(team_round, x="Round", y="Avg_Total_Tips", color="Team", markers=True, labels={"Avg_Total_Tips": "Average total tips"})
+team_momentum.update_xaxes(dtick=1)
+team_momentum.update_layout(height=520)
+st.plotly_chart(team_momentum, use_container_width=True)
