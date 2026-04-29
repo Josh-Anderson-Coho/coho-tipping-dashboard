@@ -1,15 +1,27 @@
-# Coho Tipping Dashboard
+# Coho Footy Tipping Dashboard
 
-Streamlit prototype built from the Round 6 ESPN Footy Tips CSV.
+## Files
+Upload this whole folder to GitHub. Keep ESPN files in `/data` using filenames like:
 
-## Local run
-```bash
-pip install -r requirements.txt
-streamlit run app.py
+`competition-Coho Footy Tipping-nrl-9.csv`
+
+The app detects the round number from `nrl-9` and will work for any future NRL round/finals file as long as the filename contains that number.
+
+## GitHub upload from dashboard
+The sidebar uploader is password protected with:
+
+`C@H@`
+
+To let the dashboard commit uploaded CSVs back to GitHub, add these Streamlit secrets:
+
+```toml
+[github]
+token = "YOUR_GITHUB_FINE_GRAINED_TOKEN_WITH_CONTENTS_READ_WRITE"
+repo = "Josh-Anderson-Coho/coho-tipping-dashboard"
+branch = "main"
+data_path = "data"
 ```
 
-## Weekly use
-Open the dashboard and upload the latest ESPN CSV in the sidebar. The app recalculates the ladder, weekly highlights, rank movement and team rankings.
+Create the token in GitHub with access to this repository and Contents: Read and write.
 
-## Teams
-Edit `data/team_mapping.csv` to assign real teams. Names must match the ESPN `NAME` column.
+After a successful upload, Streamlit Cloud should redeploy from the GitHub commit.
